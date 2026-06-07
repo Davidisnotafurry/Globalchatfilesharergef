@@ -1,0 +1,1519 @@
+-- [[ GEF BUILD SAVER COMMUNITY EXPANSION - FINAL BUG-FREE UNIFIED SCRIPT ]] --
+_G.IS_ADMIN = false -- Set to true to unlock the database Blacklist/Ban Management controls
+
+if game:GetService("CoreGui"):FindFirstChild("GefBuildSaverCommunity") then
+    warn("Gef Build Saver Community is already running!")
+    return
+end
+
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
+local LocalPlayer = Players.LocalPlayer
+
+local FIREBASE_URL = "https://gefbuildsaverapi-default-rtdb.firebaseio.com/"
+local FOLDER_PATH = "GefBuildSaverBuilds"
+local SETTINGS_FILE = "GefBuildShareCommunitySettings"
+
+-- Shared state initialization with extreme runtime safety
+shared.IgnoredPlayers = shared.IgnoredPlayers or {}
+shared.SelectedFilesToPublish = shared.SelectedFilesToPublish or {}
+shared.SelectedIgnoredPlayers = shared.SelectedIgnoredPlayers or {}
+
+if type(shared.Cooldowns) ~= "table" then
+    shared.Cooldowns = { publish = 0, joinToggle = 0, chat = 0 }
+end
+
+shared.BundleNameText = shared.BundleNameText or "Unamed Bundle"
+_G.FileFilterText = _G.FileFilterText or ""
+_G.PublishFilterText = _G.PublishFilterText or ""
+shared.UI_Locked = false
+shared.IsMinimized = false
+shared.AllowJoiningToggle = true
+shared.CurrentLocalScriptUsers = shared.CurrentLocalScriptUsers or {}
+
+shared.InitialChatLoaded = false
+shared.InitialFilesLoaded = false
+shared.KnownFileKeys = shared.KnownFileKeys or {}
+shared.KnownGlobalUsers = shared.KnownGlobalUsers or {}
+
+-- Configuration Defaults
+shared.Config = {
+    Notifywhenplayerjoinsyourserver = true,
+    Notifywhennewmessageonchat = true,
+    Notifywhenplayerleavesyourserver = true,
+    Notifywhennewfileispublished = true,
+    Notificationsoundid = "130501547093536",
+    Notificationsoundvolume = 1,
+    Notificationsoundpitchmax = 1.2,
+    Notificationsoundpitchmin = 0.8
+}
+
+-- [[ CONFIGURATION FILE SYSTEM ENGINE ]] --
+local function serializeConfig()
+    local blockedList = {}
+    for user, _ in pairs(shared.IgnoredPlayers) do
+        table.insert(blockedList, string.format('"%s"', user))
+    end
+    local blockedStr = "{" .. table.concat(blockedList, ",") .. "}"
+    
+    local lines = {
+        "BlockedUsers: " .. blockedStr,
+        "JoinEnabled: " .. tostring(shared.AllowJoiningToggle),
+        "Notifywhenplayerjoinsyourserver: " .. tostring(shared.Config.Notifywhenplayerjoinsyourserver),
+        "Notifywhennewmessageonchat: " .. tostring(shared.Config.Notifywhennewmessageonchat),
+        "Notifywhenplayerleavesyourserver: " .. tostring(shared.Config.Notifywhenplayerleavesyourserver),
+        "Notifywhennewfileispublished: " .. tostring(shared.Config.Notifywhennewfileispublished),
+        "Notificationsoundid: " .. tostring(shared.Config.Notificationsoundid),
+        "Notificationsoundvolume: " .. tostring(shared.Config.Notificationsoundvolume),
+        "Notificationsoundpitchmax: " .. tostring(shared.Config.Notificationsoundpitchmax),
+        "Notificationsoundpitchmin: " .. tostring(shared.Config.Notificationsoundpitchmin)
+    }
+    return table.concat(lines, "\n")
+end
+
+local function saveConfig()
+    pcall(function()
+        writefile(SETTINGS_FILE, serializeConfig())
+    end)
+end
+
+local function loadConfig()
+    if not isfile(SETTINGS_FILE) then
+        saveConfig()
+        return
+    end
+    pcall(function()
+        local data = readfile(SETTINGS_FILE)
+        for line in string.gmatch(data, "[^\r\n]+") do
+            local key, val = string.match(line, "([^:]+):%s*(.*)")
+            if key and val then
+                key = key:gsub("%s+", "")
+                if key == "BlockedUsers" then
+                    local listStr = string.match(val, "{(.*)}")
+                    if listStr then
+                        for user in string.gmatch(listStr, '"([^"]+)"') do
+                            shared.IgnoredPlayers[user] = true
+                        end
+                    end
+                elseif key == "JoinEnabled" then
+                    shared.AllowJoiningToggle = (val == "true")
+                elseif shared.Config[key] ~= nil then
+                    if val == "true" or val == "false" then
+                        shared.Config[key] = (val == "true")
+                    else
+                        shared.Config[key] = tonumber(val) or val
+                    end
+                end
+            end
+        end
+    end)
+end
+
+loadConfig()
+
+-- [[ CORE UTILITIES & NETWORKING ]] --
+local function getDeviceID()
+    if gethwid then return gethwid() end
+    return game:GetService("RbxAnalyticsService"):GetClientId()
+end
+
+local function firebaseRequest(method, path, body)
+    local url = FIREBASE_URL .. path .. ".json"
+    local success, response = pcall(function()
+        return request({
+            Url = url,
+            Method = method,
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body and HttpService:JSONEncode(body) or nil
+        })
+    end)
+    if success and response.StatusCode == 200 and response.Body ~= "null" then
+        return HttpService:JSONDecode(response.Body)
+    end
+    return nil
+end
+_G.firebaseRequest = firebaseRequest
+
+local function validateBuildFile(content)
+    local securityThreats = {"loadstring", "require", "getfenv", "spawn", "coroutine", "HttpService", "MarketplaceService"}
+    for _, threat in ipairs(securityThreats) do
+        if content:find(threat) then return false, 0 end
+    end
+    if not content:find("GridPos:") or not content:find("return%s*{") then return false, 0 end
+    local _, plankCount = content:gsub("Vector3.new", "")
+    return true, plankCount
+end
+_G.validateBuildFile = validateBuildFile
+
+-- [[ GHOST NOTIFICATION SYSTEM ENGINE ]] --
+local NotificationGui = Instance.new("ScreenGui")
+NotificationGui.Name = "GefNotificationOverlay"
+NotificationGui.Parent = game:GetService("CoreGui")
+
+local activeNotifications = {}
+local MAX_NOTIFICATIONS = 5
+local NOTIFICATION_WIDTH = 280
+local NOTIFICATION_HEIGHT = 65
+local NOTIFICATION_PADDING = 8
+
+local function cleanSoundId(input)
+    local id = string.match(tostring(input), "%d+")
+    return id or "130501547093536"
+end
+
+local function playNotificationSound()
+    local rawId = cleanSoundId(shared.Config.Notificationsoundid)
+    local vol = tonumber(shared.Config.Notificationsoundvolume) or 1
+    local pMin = tonumber(shared.Config.Notificationsoundpitchmin) or 0.8
+    local pMax = tonumber(shared.Config.Notificationsoundpitchmax) or 1.2
+    
+    local sound = Instance.new("Sound")
+    sound.SoundId = "rbxassetid://" .. rawId
+    sound.Volume = vol
+    sound.Pitch = math.random() * (pMax - pMin) + pMin
+    sound.Parent = SoundService
+    sound:Play()
+    task.delay(5, function() sound:Destroy() end)
+end
+
+local function rearrangeNotifications()
+    for idx, frame in ipairs(activeNotifications) do
+        local targetYOffset = -115 - ((idx - 1) * (NOTIFICATION_HEIGHT + NOTIFICATION_PADDING))
+        TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Position = UDim2.new(1, -NOTIFICATION_WIDTH - 15, 1, targetYOffset)
+        }):Play()
+    end
+end
+
+local function createGhostNotification(title, text)
+    playNotificationSound()
+    
+    if #activeNotifications >= MAX_NOTIFICATIONS then
+        local oldest = table.remove(activeNotifications, 1)
+        if oldest then oldest:Destroy() end
+    end
+    
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(0, NOTIFICATION_WIDTH, 0, NOTIFICATION_HEIGHT)
+    Frame.Position = UDim2.new(1, 10, 1, -115) 
+    Frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    Frame.BorderSizePixel = 1
+    Frame.BorderColor3 = Color3.fromRGB(0, 255, 255)
+    Frame.Active = false
+    Frame.Selectable = false
+    Frame.Parent = NotificationGui
+    
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 4)
+    Corner.Parent = Frame
+    
+    local TitleLbl = Instance.new("TextLabel")
+    TitleLbl.Size = UDim2.new(1, -16, 0, 20)
+    TitleLbl.Position = UDim2.new(0, 8, 0, 4)
+    TitleLbl.BackgroundTransparency = 1
+    TitleLbl.Text = title
+    TitleLbl.TextColor3 = Color3.fromRGB(0, 255, 255)
+    TitleLbl.TextSize = 12
+    TitleLbl.Font = Enum.Font.SourceSansBold
+    TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    TitleLbl.Parent = Frame
+    
+    local MsgLbl = Instance.new("TextLabel")
+    MsgLbl.Size = UDim2.new(1, -16, 0, 32)
+    MsgLbl.Position = UDim2.new(0, 8, 0, 22)
+    MsgLbl.BackgroundTransparency = 1
+    MsgLbl.Text = text
+    MsgLbl.TextColor3 = Color3.fromRGB(240, 240, 240)
+    MsgLbl.TextSize = 11
+    MsgLbl.TextWrapped = true
+    MsgLbl.TextXAlignment = Enum.TextXAlignment.Left
+    MsgLbl.TextYAlignment = Enum.TextYAlignment.Top
+    MsgLbl.Parent = Frame
+    
+    local ProgressBar = Instance.new("Frame")
+    ProgressBar.Size = UDim2.new(0, 0, 0, 2)
+    ProgressBar.Position = UDim2.new(0, 0, 1, -2)
+    ProgressBar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    ProgressBar.BorderSizePixel = 0
+    ProgressBar.Parent = Frame
+    
+    table.insert(activeNotifications, Frame)
+    rearrangeNotifications()
+    
+    TweenService:Create(ProgressBar, TweenInfo.new(4.5, Enum.EasingStyle.Linear), {
+        Size = UDim2.new(1, 0, 0, 2)
+    }):Play()
+    
+    task.delay(4.5, function()
+        if Frame and Frame.Parent then
+            local slideOut = TweenService:Create(Frame, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+                Position = UDim2.new(1, 10, Frame.Position.Y.Scale, Frame.Position.Y.Offset)
+            })
+            slideOut:Play()
+            slideOut.Completed:Wait()
+            
+            local findIdx = table.find(activeNotifications, Frame)
+            if findIdx then
+                table.remove(activeNotifications, findIdx)
+                rearrangeNotifications()
+            end
+            Frame:Destroy()
+        end
+    end)
+end
+
+-- [[ CORE INTERFACE ARCHITECTURE ]] --
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "GefBuildSaverCommunity"
+ScreenGui.Parent = game:GetService("CoreGui")
+_G.GefScreenGui = ScreenGui
+
+local function createPopup(message)
+    local PopupFrame = Instance.new("Frame")
+    PopupFrame.Size = UDim2.new(0, 280, 0, 120)
+    PopupFrame.Position = UDim2.new(0.5, -140, 0.4, -60)
+    PopupFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    PopupFrame.BorderSizePixel = 2
+    PopupFrame.BorderColor3 = Color3.fromRGB(235, 90, 90)
+    PopupFrame.ZIndex = 50
+    PopupFrame.Parent = _G.GefScreenGui
+
+    local MsgLabel = Instance.new("TextLabel")
+    MsgLabel.Size = UDim2.new(1, -20, 1, -40)
+    MsgLabel.Position = UDim2.new(0, 10, 0, 10)
+    MsgLabel.BackgroundTransparency = 1
+    MsgLabel.Text = message
+    MsgLabel.TextColor3 = Color3.fromRGB(230, 230, 230)
+    MsgLabel.TextSize = 13
+    MsgLabel.TextWrapped = true
+    MsgLabel.ZIndex = 51
+    MsgLabel.Parent = PopupFrame
+
+    local CloseBtn = Instance.new("TextButton")
+    CloseBtn.Size = UDim2.new(0, 25, 0, 25)
+    CloseBtn.Position = UDim2.new(1, -30, 0, 5)
+    CloseBtn.BackgroundTransparency = 1
+    CloseBtn.Text = "❌"
+    CloseBtn.TextSize = 14
+    CloseBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+    CloseBtn.ZIndex = 52
+    CloseBtn.Parent = PopupFrame
+    CloseBtn.MouseButton1Click:Connect(function() PopupFrame:Destroy() end)
+end
+_G.createPopup = createPopup
+
+local nameBan = firebaseRequest("GET", "bans/" .. LocalPlayer.Name)
+local hwidBan = firebaseRequest("GET", "bans/" .. getDeviceID())
+shared.isMuted = (nameBan or hwidBan) and true or false
+if shared.isMuted then createPopup("You have been muted. You can see chat/download files but can't send or chat.") end
+
+local MainWindow = Instance.new("Frame")
+MainWindow.Size = UDim2.new(0, 440, 0, 400)
+MainWindow.Position = UDim2.new(0.5, -220, 0.5, -200)
+MainWindow.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+MainWindow.BorderSizePixel = 0
+MainWindow.Parent = _G.GefScreenGui
+_G.MainWindowRef = MainWindow
+
+local FloatingBtn = Instance.new("TextButton")
+FloatingBtn.Size = UDim2.new(0, 35, 0, 35)
+FloatingBtn.Position = UDim2.new(0.1, 0, 0.1, 0)
+FloatingBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+FloatingBtn.BorderSizePixel = 2
+FloatingBtn.BorderColor3 = Color3.fromRGB(55, 90, 160)
+FloatingBtn.Text = "➕"
+FloatingBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+FloatingBtn.TextSize = 16
+FloatingBtn.Visible = false
+FloatingBtn.ZIndex = 15
+FloatingBtn.Parent = _G.GefScreenGui
+_G.FloatingBtnRef = FloatingBtn
+
+local TitleBar = Instance.new("Frame")
+TitleBar.Size = UDim2.new(1, 0, 0, 40)
+TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+TitleBar.Parent = MainWindow
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(0.5, 0, 1, 0)
+TitleLabel.Position = UDim2.new(0, 12, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "Gef build saver" .. (_G.IS_ADMIN and " [ADMIN]" or "")
+TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+TitleLabel.TextSize = 14
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TitleBar
+
+local dragActive, dragInput, dragStart, startPos
+TitleBar.InputBegan:Connect(function(input)
+    if not shared.UI_Locked and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        dragActive = true
+        dragStart = input.Position
+        startPos = MainWindow.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragActive = false end
+        end)
+    end
+end)
+TitleBar.InputChanged:Connect(function(input)
+    if not shared.UI_Locked and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        dragInput = input
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragActive then
+        local delta = input.Position - dragStart
+        MainWindow.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+local floatActive, floatInput, floatStart, floatOrigPos
+FloatingBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        floatActive = true
+        floatStart = input.Position
+        floatOrigPos = FloatingBtn.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then floatActive = false end
+        end)
+    end
+end)
+FloatingBtn.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        floatInput = input
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if input == floatInput and floatActive then
+        local delta = input.Position - floatStart
+        FloatingBtn.Position = UDim2.new(floatOrigPos.X.Scale, floatOrigPos.X.Offset + delta.X, floatOrigPos.Y.Scale, floatOrigPos.Y.Offset + delta.Y)
+    end
+end)
+
+FloatingBtn.MouseButton1Click:Connect(function()
+    MainWindow.Visible = true
+    FloatingBtn.Visible = false
+end)
+
+local ContentFrame = Instance.new("Frame")
+ContentFrame.Size = UDim2.new(1, 0, 1, -40)
+ContentFrame.Position = UDim2.new(0, 0, 0, 40)
+ContentFrame.BackgroundTransparency = 1
+ContentFrame.Parent = MainWindow
+
+local LockBtn = Instance.new("TextButton")
+LockBtn.Size = UDim2.new(0, 30, 0, 30)
+LockBtn.Position = UDim2.new(1, -105, 0, 5)
+LockBtn.BackgroundTransparency = 1
+LockBtn.Text = "🔓"
+LockBtn.TextSize = 15
+LockBtn.Parent = TitleBar
+LockBtn.MouseButton1Click:Connect(function()
+    shared.UI_Locked = not shared.UI_Locked
+    LockBtn.Text = shared.UI_Locked and "🔒" or "🔓"
+end)
+
+local MinimizeBtn = Instance.new("TextButton")
+MinimizeBtn.Size = UDim2.new(0, 30, 0, 30)
+MinimizeBtn.Position = UDim2.new(1, -70, 0, 5)
+MinimizeBtn.BackgroundTransparency = 1
+MinimizeBtn.Text = "➖"
+MinimizeBtn.TextSize = 15
+MinimizeBtn.Parent = TitleBar
+MinimizeBtn.MouseButton1Click:Connect(function()
+    shared.IsMinimized = not shared.IsMinimized
+    ContentFrame.Visible = not shared.IsMinimized
+    MainWindow.Size = shared.IsMinimized and UDim2.new(0, MainWindow.Size.X.Offset, 0, 40) or UDim2.new(0, MainWindow.Size.X.Offset, 0, 400)
+end)
+
+local CloseGuiBtn = Instance.new("TextButton")
+CloseGuiBtn.Size = UDim2.new(0, 30, 0, 30)
+CloseGuiBtn.Position = UDim2.new(1, -35, 0, 5)
+CloseGuiBtn.BackgroundTransparency = 1
+CloseGuiBtn.Text = "❌"
+CloseGuiBtn.TextSize = 14
+CloseGuiBtn.Parent = TitleBar
+CloseGuiBtn.MouseButton1Click:Connect(function()
+    MainWindow.Visible = false
+    FloatingBtn.Visible = true
+end)
+
+local TabHeaderBar = Instance.new("Frame")
+TabHeaderBar.Size = UDim2.new(1, 0, 0, 35)
+TabHeaderBar.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+TabHeaderBar.Parent = ContentFrame
+
+shared.Pages = {}
+local TabNames = {"Public Files", "Publish Files", "Settings", "Global Chat", "Active Players"}
+for idx, tabTitle in ipairs(TabNames) do
+    local TabButton = Instance.new("TextButton")
+    TabButton.Size = UDim2.new(1/#TabNames, 0, 1, 0)
+    TabButton.Position = UDim2.new((idx-1)/#TabNames, 0, 0, 0)
+    TabButton.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    TabButton.Text = tabTitle
+    TabButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+    TabButton.TextSize = 11
+    TabButton.Parent = TabHeaderBar
+
+    local Scroller = Instance.new("Frame")
+    Scroller.Size = UDim2.new(1, -10, 1, -45)
+    Scroller.Position = UDim2.new(0, 5, 0, 40)
+    Scroller.BackgroundTransparency = 1
+    Scroller.Visible = (idx == 1)
+    Scroller.Parent = ContentFrame
+    shared.Pages[tabTitle] = Scroller
+
+    TabButton.MouseButton1Click:Connect(function()
+        for _, page in pairs(shared.Pages) do
+            page.Visible = false
+        end
+        Scroller.Visible = true
+    end)
+end
+
+-- [[ PUBLIC FILES SYSTEM MANAGEMENT ]] --
+local PublicTab = shared.Pages["Public Files"]
+local FilterBox = Instance.new("TextBox")
+FilterBox.Size = UDim2.new(1, -10, 0, 30)
+FilterBox.Position = UDim2.new(0, 0, 0, 0)
+FilterBox.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+FilterBox.BorderSizePixel = 1
+FilterBox.BorderColor3 = Color3.fromRGB(75, 75, 80)
+FilterBox.Text = _G.FileFilterText
+FilterBox.PlaceholderText = "🔍 Filter by Package Name or Creator..."
+FilterBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+FilterBox.TextSize = 12
+FilterBox.Parent = PublicTab
+
+local PublicScroller = Instance.new("ScrollingFrame")
+PublicScroller.Size = UDim2.new(1, 0, 1, -35)
+PublicScroller.Position = UDim2.new(0, 0, 0, 35)
+PublicScroller.BackgroundTransparency = 1
+PublicScroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+PublicScroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+PublicScroller.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+PublicScroller.Parent = PublicTab
+
+FilterBox:GetPropertyChangedSignal("Text"):Connect(function()
+    _G.FileFilterText = FilterBox.Text
+    _G.renderPublicFiles()
+end)
+_G.PublicScrollerRef = PublicScroller
+
+_G.renderPublicFiles = function()
+    local ScrollerRef = _G.PublicScrollerRef
+    if not ScrollerRef then return end
+    ScrollerRef:ClearAllChildren()
+    local layout = Instance.new("UIListLayout", ScrollerRef)
+    layout.Padding = UDim.new(0, 6)
+
+    local cloudStorage = _G.firebaseRequest("GET", "files") or {}
+    local dataSequence = {}
+    for key, item in pairs(cloudStorage) do
+        if type(item) == "table" and item.creator and item.bundleName then 
+            item.fbKey = key 
+            table.insert(dataSequence, item) 
+            
+            if shared.InitialFilesLoaded and not shared.KnownFileKeys[key] then
+                shared.KnownFileKeys[key] = true
+                if shared.Config.Notifywhenfileispublished and item.creator ~= LocalPlayer.Name then
+                    createGhostNotification("File published", string.format("%s has published a new file!", item.creator))
+                end
+            elseif not shared.InitialFilesLoaded then
+                shared.KnownFileKeys[key] = true
+            end
+        end
+    end
+    shared.InitialFilesLoaded = true
+    
+    table.sort(dataSequence, function(a, b) return (a.timestamp or 0) > (b.timestamp or 0) end)
+
+    local filterLower = _G.FileFilterText:lower()
+    for order, asset in ipairs(dataSequence) do
+        if order > 200 then break end
+        if shared.IgnoredPlayers[asset.creator] then continue end
+
+        local bName = asset.bundleName or "Unamed Package"
+        local creatorName = asset.creator or "Unknown"
+        if filterLower ~= "" and not bName:lower():find(filterLower) and not creatorName:lower():find(filterLower) then
+            continue
+        end
+
+        local ItemCard = Instance.new("Frame")
+        ItemCard.Size = UDim2.new(1, -10, 0, 135)
+        ItemCard.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+        ItemCard.Parent = ScrollerRef
+
+        local UserLink = Instance.new("TextButton")
+        UserLink.Size = UDim2.new(0.5, 0, 0, 22)
+        UserLink.Position = UDim2.new(0, 6, 0, 2)
+        UserLink.BackgroundTransparency = 1
+        UserLink.Text = "👤 " .. creatorName
+        UserLink.TextColor3 = Color3.fromRGB(140, 180, 230)
+        UserLink.TextSize = 13
+        UserLink.TextXAlignment = Enum.TextXAlignment.Left
+        UserLink.Parent = ItemCard
+
+        local BundleLabel = Instance.new("TextLabel")
+        BundleLabel.Size = UDim2.new(0.5, 0, 0, 22)
+        BundleLabel.Position = UDim2.new(0.5, -6, 0, 2)
+        BundleLabel.BackgroundTransparency = 1
+        BundleLabel.Text = "📦 " .. bName
+        BundleLabel.TextColor3 = Color3.fromRGB(215, 165, 85)
+        BundleLabel.TextSize = 12
+        BundleLabel.TextXAlignment = Enum.TextXAlignment.Right
+        BundleLabel.Parent = ItemCard
+
+        local TimeLabel = Instance.new("TextLabel")
+        TimeLabel.Size = UDim2.new(1, -12, 0, 16)
+        TimeLabel.Position = UDim2.new(0, 6, 0, 22)
+        TimeLabel.BackgroundTransparency = 1
+        TimeLabel.Text = "🕒 Global Time: " .. (asset.dateString or "Pre-update Creation")
+        TimeLabel.TextColor3 = Color3.fromRGB(140, 140, 145)
+        TimeLabel.TextSize = 11
+        TimeLabel.TextXAlignment = Enum.TextXAlignment.Left
+        TimeLabel.Parent = ItemCard
+
+        local InnerScroller = Instance.new("ScrollingFrame")
+        InnerScroller.Size = UDim2.new(1, -12, 0, 45)
+        InnerScroller.Position = UDim2.new(0, 6, 0, 40)
+        InnerScroller.BackgroundTransparency = 1
+        InnerScroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+        InnerScroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        InnerScroller.ScrollBarThickness = 4
+        InnerScroller.Parent = ItemCard
+        Instance.new("UIListLayout", InnerScroller).Padding = UDim.new(0, 2)
+
+        if asset.names then
+            for nIdx, filename in pairs(asset.names) do
+                local FileRow = Instance.new("TextLabel")
+                FileRow.Size = UDim2.new(1, -6, 0, 16)
+                FileRow.BackgroundTransparency = 1
+                FileRow.Text = "📄 " .. filename .. " {" .. (asset.plankData and asset.plankData[nIdx] or 0) .. "}"
+                FileRow.TextColor3 = Color3.fromRGB(175, 175, 175)
+                FileRow.TextSize = 11
+                FileRow.TextXAlignment = Enum.TextXAlignment.Left
+                FileRow.Parent = InnerScroller
+            end
+        end
+
+        local LoadBtn = Instance.new("TextButton")
+        LoadBtn.Size = UDim2.new(0, 100, 0, 24)
+        LoadBtn.Position = UDim2.new(1, -106, 1, -28)
+        LoadBtn.BackgroundColor3 = Color3.fromRGB(45, 110, 45)
+        LoadBtn.Text = "Download"
+        LoadBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        LoadBtn.TextSize = 12
+        LoadBtn.Parent = ItemCard
+
+        LoadBtn.MouseButton1Click:Connect(function()
+            if not isfolder(FOLDER_PATH) then makefolder(FOLDER_PATH) end
+            for fileIndex, diskName in pairs(asset.names) do
+                local bodyText = asset.contents[fileIndex]
+                if bodyText then writefile(FOLDER_PATH .. "/" .. diskName, bodyText) end
+            end
+            _G.createPopup("Downloaded assets created on device path perfectly! B)")
+        end)
+
+        UserLink.MouseButton1Click:Connect(function()
+            local isOwner = (LocalPlayer.Name == asset.creator)
+            local MenuFrame = Instance.new("Frame")
+            MenuFrame.Size = UDim2.new(0, 150, 0, (_G.IS_ADMIN or isOwner) and 140 or 80)
+            MenuFrame.Position = UDim2.new(0.5, -75, 0.5, -40)
+            MenuFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+            MenuFrame.BorderSizePixel = 1
+            MenuFrame.ZIndex = 20
+            MenuFrame.Parent = _G.GefScreenGui
+            Instance.new("UIListLayout", MenuFrame)
+
+            local function appendAction(label, fontColor, trigger)
+                local btn = Instance.new("TextButton")
+                btn.Size = UDim2.new(1, 0, 0, 30)
+                btn.BackgroundTransparency = 1
+                btn.Text = label
+                btn.TextColor3 = fontColor
+                btn.TextSize = 12
+                btn.ZIndex = 20
+                btn.Parent = MenuFrame
+                btn.MouseButton1Click:Connect(function() trigger() MenuFrame:Destroy() end)
+            end
+
+            appendAction("Join Game", Color3.fromRGB(100, 200, 100), function()
+                local status = _G.firebaseRequest("GET", "presence/" .. asset.creator)
+                if status and type(status) == "table" and (_G.IS_ADMIN or (status.allowJoining and status.jobId)) then
+                    _G.firebaseRequest("PUT", "presence/" .. asset.creator .. "/notification", { visitor = LocalPlayer.Name })
+                    _G.createPopup("Connecting instance...")
+                    TeleportService:TeleportToPlaceInstance(status.placeId or game.PlaceId, status.jobId, LocalPlayer)
+                else _G.createPopup("The guy doesnt have join on.") end
+            end)
+
+            if _G.IS_ADMIN then
+                appendAction("Ban", Color3.fromRGB(255, 50, 50), function()
+                    _G.firebaseRequest("PUT", "bans/" .. asset.creator, {banned = true, hwid = asset.hwid})
+                    _G.createPopup("Target profile blacklisted.")
+                    _G.renderSettings()
+                end)
+            elseif not isOwner then
+                appendAction("Block", Color3.fromRGB(220, 100, 100), function()
+                    shared.IgnoredPlayers[asset.creator] = true
+                    saveConfig()
+                    _G.renderPublicFiles()
+                    _G.renderSettings()
+                end)
+            end
+
+            if isOwner or _G.IS_ADMIN then
+                appendAction("Delete", Color3.fromRGB(255, 120, 50), function()
+                    _G.firebaseRequest("DELETE", "files/" .. asset.fbKey)
+                    _G.renderPublicFiles()
+                end)
+            end
+            appendAction("[ Close ]", Color3.fromRGB(140, 140, 140), function() end)
+        end)
+    end
+end
+
+-- [[ FILE PUBLISHING MANAGEMENT ]] --
+local PublishTab = shared.Pages["Publish Files"]
+local PublishTopFrame = Instance.new("Frame")
+PublishTopFrame.Size = UDim2.new(1, 0, 0, 175)
+PublishTopFrame.BackgroundTransparency = 1
+PublishTopFrame.Parent = PublishTab
+
+local Notice = Instance.new("TextLabel")
+Notice.Size = UDim2.new(1, -10, 0, 70)
+Notice.BackgroundTransparency = 1
+Notice.Text = "Pay attention.\nyour files you publish will be removed if 200+ files are made..."
+Notice.TextColor3 = Color3.fromRGB(210, 140, 70)
+Notice.TextSize = 11
+Notice.TextWrapped = true
+Notice.Parent = PublishTopFrame
+
+local BundleNameBox = Instance.new("TextBox")
+BundleNameBox.Size = UDim2.new(1, -10, 0, 32)
+BundleNameBox.Position = UDim2.new(0, 0, 0, 70)
+BundleNameBox.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+BundleNameBox.Text = shared.BundleNameText
+BundleNameBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+BundleNameBox.TextSize = 12
+BundleNameBox.Parent = PublishTopFrame
+BundleNameBox:GetPropertyChangedSignal("Text"):Connect(function() shared.BundleNameText = BundleNameBox.Text end)
+
+local PushButton = Instance.new("TextButton")
+PushButton.Size = UDim2.new(1, -10, 0, 35)
+PushButton.Position = UDim2.new(0, 0, 0, 105)
+PushButton.BackgroundColor3 = Color3.fromRGB(55, 90, 160)
+PushButton.Text = "Publish Selection"
+PushButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+PushButton.TextSize = 13
+PushButton.Parent = PublishTopFrame
+
+local PublishFilterBox = Instance.new("TextBox")
+PublishFilterBox.Size = UDim2.new(1, -10, 0, 30)
+PublishFilterBox.Position = UDim2.new(0, 0, 0, 145)
+PublishFilterBox.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+PublishFilterBox.Text = _G.PublishFilterText
+PublishFilterBox.PlaceholderText = "🔍 Search local folder files..."
+PublishFilterBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+PublishFilterBox.TextSize = 12
+PublishFilterBox.Parent = PublishTopFrame
+
+local PublishScroller = Instance.new("ScrollingFrame")
+PublishScroller.Size = UDim2.new(1, 0, 1, -180)
+PublishScroller.Position = UDim2.new(0, 0, 0, 180)
+PublishScroller.BackgroundTransparency = 1
+PublishScroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+PublishScroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+PublishScroller.Parent = PublishTab
+
+PublishFilterBox:GetPropertyChangedSignal("Text"):Connect(function()
+    _G.PublishFilterText = PublishFilterBox.Text
+    _G.renderPublishFiles()
+end)
+
+_G.renderPublishFiles = function()
+    PublishScroller:ClearAllChildren()
+    Instance.new("UIListLayout", PublishScroller).Padding = UDim.new(0, 6)
+    if not isfolder(FOLDER_PATH) then makefolder(FOLDER_PATH) end
+    local systemFiles = listfiles(FOLDER_PATH)
+    local publishFilterLower = _G.PublishFilterText:lower()
+
+    for _, path in ipairs(systemFiles) do
+        local actualName = path:match("([^/]+)$")
+        if actualName then
+            if publishFilterLower ~= "" and not actualName:lower():find(publishFilterLower) then continue end
+            local activelySelected = table.find(shared.SelectedFilesToPublish, actualName)
+
+            local ItemSelector = Instance.new("TextButton")
+            ItemSelector.Size = UDim2.new(1, -10, 0, 32)
+            ItemSelector.BackgroundColor3 = activelySelected and Color3.fromRGB(50, 70, 110) or Color3.fromRGB(35, 35, 40)
+            ItemSelector.Text = (activelySelected and "[ SELECTED ]  " or "📄  ") .. actualName
+            ItemSelector.TextColor3 = Color3.fromRGB(240, 240, 240)
+            ItemSelector.TextSize = 12
+            ItemSelector.Parent = PublishScroller
+
+            ItemSelector.MouseButton1Click:Connect(function()
+                local matchedIndex = table.find(shared.SelectedFilesToPublish, actualName)
+                if matchedIndex then table.remove(shared.SelectedFilesToPublish, matchedIndex)
+                else
+                    if #shared.SelectedFilesToPublish >= 10 then _G.createPopup("Max 10 files allowed!") return end
+                    table.insert(shared.SelectedFilesToPublish, actualName)
+                end
+                _G.renderPublishFiles()
+            end)
+        end
+    end
+end
+
+PushButton.MouseButton1Click:Connect(function()
+    if shared.isMuted then _G.createPopup("Muted profiles cannot publish resources.") return end
+    
+    local publishCooldown = tonumber(shared.Cooldowns and shared.Cooldowns.publish) or 0
+    if os.time() - publishCooldown < 30 then 
+        _G.createPopup("Please wait 30 seconds.") 
+        return 
+    end
+    if #shared.SelectedFilesToPublish == 0 then return end
+
+    local packetNames, packetContents, packetPlanks = {}, {}, {}
+    for _, selection in ipairs(shared.SelectedFilesToPublish) do
+        local fileData = readfile(FOLDER_PATH .. "/" .. selection)
+        local clean, countedPlanks = _G.validateBuildFile(fileData)
+        if clean then
+            table.insert(packetNames, selection)
+            table.insert(packetContents, fileData)
+            table.insert(packetPlanks, countedPlanks)
+        else _G.createPopup("Validation failed: " .. selection) return end
+    end
+
+    local submissionPayload = {
+        creator = LocalPlayer.Name,
+        hwid = game:GetService("RbxAnalyticsService"):GetClientId(),
+        bundleName = shared.BundleNameText ~= "" and shared.BundleNameText or "Unamed Bundle",
+        names = packetNames,
+        contents = packetContents,
+        plankData = packetPlanks,
+        timestamp = os.time(),
+        dateString = DateTime.now():FormatUniversalTime("YYYY-MM-DD HH:mm", "en-us")
+    }
+
+    _G.firebaseRequest("POST", "files", submissionPayload)
+    shared.Cooldowns.publish = os.time()
+    if _G.networkPulse then _G.networkPulse() end
+    _G.createPopup("Published successfully!")
+    shared.SelectedFilesToPublish = {}
+    _G.renderPublishFiles()
+    _G.renderPublicFiles()
+end)
+
+-- [[ GLOBAL CHAT MANAGEMENT ]] --
+local ChatTab = shared.Pages["Global Chat"]
+local ChatScroller = Instance.new("ScrollingFrame")
+ChatScroller.Size = UDim2.new(1, 0, 1, -55)
+ChatScroller.BackgroundTransparency = 1
+ChatScroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+ChatScroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ChatScroller.Parent = ChatTab
+
+local ChatList = Instance.new("UIListLayout")
+ChatList.Padding = UDim.new(0, 4)
+ChatList.SortOrder = Enum.SortOrder.LayoutOrder
+ChatList.Parent = ChatScroller
+
+local ChatInputFrame = Instance.new("Frame")
+ChatInputFrame.Size = UDim2.new(1, -10, 0, 50)
+ChatInputFrame.Position = UDim2.new(0, 0, 1, -50)
+ChatInputFrame.BackgroundTransparency = 1
+ChatInputFrame.Parent = ChatTab
+
+local ChatBox = Instance.new("TextBox")
+ChatBox.Size = UDim2.new(1, -70, 1, 0)
+ChatBox.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+ChatBox.Text = ""
+ChatBox.PlaceholderText = "Type message here (Max 7 lines)"
+ChatBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+ChatBox.TextSize = 12
+ChatBox.TextWrapped = true
+ChatBox.MultiLine = true
+ChatBox.ClearTextOnFocus = false
+ChatBox.Parent = ChatInputFrame
+
+local ChatSendBtn = Instance.new("TextButton")
+ChatSendBtn.Size = UDim2.new(0, 65, 1, 0)
+ChatSendBtn.Position = UDim2.new(1, -65, 0, 0)
+ChatSendBtn.BackgroundColor3 = Color3.fromRGB(55, 90, 160)
+ChatSendBtn.Text = "SEND"
+ChatSendBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ChatSendBtn.TextSize = 13
+ChatSendBtn.Parent = ChatInputFrame
+
+local KnownMessages = {}
+local speechBillboardCache = {}
+
+local function createSpeechBubble(player, text)
+    if not player or not player.Character or not player.Character:FindFirstChild("Head") then return end
+    local targetHead = player.Character.Head
+    local bGui = speechBillboardCache[player.Name]
+    local containerFrame
+    
+    if not bGui or bGui.Parent == nil then
+        bGui = Instance.new("BillboardGui")
+        bGui.Name = "GefSpeechBubbleUI"
+        bGui.Size = UDim2.new(0, 200, 0, 140)
+        bGui.AlwaysOnTop = true
+        bGui.StudsOffset = Vector3.new(0, 4.5, 0)
+        bGui.Adornee = targetHead
+        bGui.Parent = game:GetService("CoreGui")
+        speechBillboardCache[player.Name] = bGui
+        
+        containerFrame = Instance.new("Frame")
+        containerFrame.Size = UDim2.new(1, 0, 1, 0)
+        containerFrame.BackgroundTransparency = 1
+        containerFrame.Parent = bGui
+        
+        local layout = Instance.new("UIListLayout")
+        layout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+        layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        layout.Padding = UDim.new(0, 4)
+        layout.Parent = containerFrame
+    else
+        containerFrame = bGui:FindFirstChildOfClass("Frame")
+    end
+    if not containerFrame then return end
+    
+    local bubble = Instance.new("Frame")
+    bubble.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+    bubble.AutomaticSize = Enum.AutomaticSize.XY
+    bubble.Parent = containerFrame
+    Instance.new("UICorner", bubble).CornerRadius = UDim.new(0, 6)
+    
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 5)
+    padding.PaddingBottom = UDim.new(0, 5)
+    padding.PaddingLeft = UDim.new(0, 10)
+    padding.PaddingRight = UDim.new(0, 10)
+    padding.Parent = bubble
+    
+    local lbl = Instance.new("TextLabel")
+    lbl.AutomaticSize = Enum.AutomaticSize.XY
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(245, 245, 245)
+    lbl.TextSize = 12
+    lbl.TextWrapped = true
+    
+    local constraint = Instance.new("UISizeConstraint")
+    constraint.MaxSize = Vector2.new(180, 70)
+    constraint.Parent = lbl
+    lbl.Parent = bubble
+    
+    task.delay(10, function()
+        if bubble and bubble.Parent then
+            local tInfo = TweenInfo.new(1, Enum.EasingStyle.Linear)
+            local t1 = TweenService:Create(lbl, tInfo, {TextTransparency = 1})
+            local t2 = TweenService:Create(bubble, tInfo, {BackgroundTransparency = 1})
+            t1:Play() t2:Play() t2.Completed:Wait()
+            bubble:Destroy()
+        end
+    end)
+end
+
+_G.fetchChat = function()
+    local chatData = _G.firebaseRequest("GET", "chat") or {}
+    local globalPresence = _G.firebaseRequest("GET", "presence") or {}
+    local msgList = {}
+    for key, msg in pairs(chatData) do
+        if type(msg) == "table" and msg.message and msg.sender then 
+            msg.key = key 
+            table.insert(msgList, msg) 
+        end
+    end
+    table.sort(msgList, function(a, b) return (a.key or "") < (b.key or "") end)
+
+    ChatScroller:ClearAllChildren()
+    local Layout = Instance.new("UIListLayout", ChatScroller)
+    Layout.Padding = UDim.new(0, 4)
+    Layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    for idx, msg in ipairs(msgList) do
+        local senderName = msg.sender or "Unknown"
+        if shared.IgnoredPlayers[senderName] then continue end
+        local messageText = msg.message and tostring(msg.message) or ""
+        if messageText == "" then continue end
+
+        if not KnownMessages[msg.key] then
+            KnownMessages[msg.key] = true
+            local targetPlayer = Players:FindFirstChild(senderName)
+            if targetPlayer then createSpeechBubble(targetPlayer, messageText) end
+            
+            if shared.InitialChatLoaded and shared.Config.Notifywhennewmessageonchat and senderName ~= LocalPlayer.Name then
+                createGhostNotification("Chat Notification", string.format("%s has said a message on chat!", senderName))
+            end
+        end
+
+        local isOnline = false
+        local trackData = globalPresence[senderName]
+        if trackData and type(trackData) == "table" and trackData.timestamp then
+            local trackTimestamp = tonumber(trackData.timestamp) or 0
+            if (os.time() - trackTimestamp <= 25) then
+                isOnline = true
+            end
+        end
+        local statusIndicator = isOnline and "🟢" or "🔴"
+
+        local MessageRowFrame = Instance.new("Frame")
+        MessageRowFrame.Size = UDim2.new(1, -10, 0, 0)
+        MessageRowFrame.BackgroundTransparency = 1
+        MessageRowFrame.AutomaticSize = Enum.AutomaticSize.Y
+        MessageRowFrame.LayoutOrder = idx
+        MessageRowFrame.Parent = ChatScroller
+
+        local SenderBtn = Instance.new("TextButton")
+        SenderBtn.Size = UDim2.new(0, 120, 0, 16)
+        SenderBtn.AutomaticSize = Enum.AutomaticSize.X
+        SenderBtn.BackgroundTransparency = 1
+        SenderBtn.Text = statusIndicator .. " 👤 " .. senderName .. ":"
+        SenderBtn.TextColor3 = Color3.fromRGB(140, 180, 230)
+        SenderBtn.TextSize = 12
+        SenderBtn.Font = Enum.Font.SourceSansBold
+        SenderBtn.TextXAlignment = Enum.TextXAlignment.Left
+        SenderBtn.Parent = MessageRowFrame
+
+        local MsgLabel = Instance.new("TextLabel")
+        MsgLabel.Size = UDim2.new(1, -15, 0, 0)
+        MsgLabel.Position = UDim2.new(0, 12, 0, 16)
+        MsgLabel.BackgroundTransparency = 1
+        MsgLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+        MsgLabel.TextSize = 12
+        MsgLabel.TextXAlignment = Enum.TextXAlignment.Left
+        MsgLabel.TextWrapped = true
+        MsgLabel.AutomaticSize = Enum.AutomaticSize.Y
+        MsgLabel.Text = messageText
+        MsgLabel.Parent = MessageRowFrame
+
+        SenderBtn.MouseButton1Click:Connect(function()
+            local isOwner = (LocalPlayer.Name == senderName)
+            local MenuFrame = Instance.new("Frame")
+            MenuFrame.Size = UDim2.new(0, 160, 0, (_G.IS_ADMIN or isOwner) and 140 or 80)
+            MenuFrame.Position = UDim2.new(0.5, -80, 0.5, -60)
+            MenuFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+            MenuFrame.Parent = _G.GefScreenGui
+            Instance.new("UIListLayout", MenuFrame)
+
+            local function appendAction(label, fontColor, trigger)
+                local btn = Instance.new("TextButton")
+                btn.Size = UDim2.new(1, 0, 0, 30)
+                btn.BackgroundTransparency = 1
+                btn.Text = label
+                btn.TextColor3 = fontColor
+                btn.TextSize = 12
+                btn.Parent = MenuFrame
+                btn.MouseButton1Click:Connect(function() trigger() MenuFrame:Destroy() end)
+            end
+
+            appendAction("Join Game", Color3.fromRGB(100, 200, 100), function()
+                local status = _G.firebaseRequest("GET", "presence/" .. senderName)
+                if status and type(status) == "table" and (_G.IS_ADMIN or (status.allowJoining and status.jobId)) then
+                    _G.firebaseRequest("PUT", "presence/" .. senderName .. "/notification", { visitor = LocalPlayer.Name })
+                    _G.createPopup("Connecting instance...")
+                    TeleportService:TeleportToPlaceInstance(status.placeId or game.PlaceId, status.jobId, LocalPlayer)
+                else _G.createPopup("The guy doesnt have join on.") end
+            end)
+
+            if _G.IS_ADMIN then
+                appendAction("Ban Player", Color3.fromRGB(255, 50, 50), function()
+                    _G.firebaseRequest("PUT", "bans/" .. senderName, {banned = true})
+                    _G.renderSettings()
+                end)
+            elseif not isOwner then
+                appendAction("Block", Color3.fromRGB(220, 100, 100), function()
+                    shared.IgnoredPlayers[senderName] = true
+                    saveConfig()
+                    _G.renderPublicFiles()
+                    _G.renderSettings()
+                    _G.fetchChat()
+                end)
+            end
+
+            if isOwner or _G.IS_ADMIN then
+                appendAction("Delete Message", Color3.fromRGB(255, 120, 50), function()
+                    _G.firebaseRequest("DELETE", "chat/" .. msg.key)
+                    _G.fetchChat()
+                end)
+            end
+            appendAction("[ Close ]", Color3.fromRGB(140, 140, 140), function() end)
+        end)
+    end
+    shared.InitialChatLoaded = true
+    ChatScroller.CanvasPosition = Vector2.new(0, 999999)
+end
+
+ChatSendBtn.MouseButton1Click:Connect(function()
+    if shared.isMuted then _G.createPopup("Muted.") return end
+    
+    local chatCooldown = tonumber(shared.Cooldowns and shared.Cooldowns.chat) or 0
+    if os.time() - chatCooldown < 3 then return end
+    local txt = ChatBox.Text
+    if txt == "" then return end
+    if select(2, txt:gsub("\n", "")) > 7 then _G.createPopup("Max 7 lines allowed.") return end
+
+    shared.Cooldowns.chat = os.time()
+    ChatBox.Text = ""
+    _G.firebaseRequest("POST", "chat", {
+        sender = LocalPlayer.Name,
+        message = txt,
+        timestamp = os.time()
+    })
+    if _G.networkPulse then _G.networkPulse() end
+    _G.fetchChat()
+end)
+
+-- [[ ACTIVE SCRIPT PLAYERS REGISTRY ]] --
+_G.renderActivePlayers = function()
+    local container = shared.Pages["Active Players"]
+    container:ClearAllChildren()
+    local Scroller = Instance.new("ScrollingFrame")
+    Scroller.Size = UDim2.new(1, 0, 1, 0)
+    Scroller.BackgroundTransparency = 1
+    Scroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+    Scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    Scroller.Parent = container
+    Instance.new("UIListLayout", Scroller).Padding = UDim.new(0, 6)
+
+    local globalPresence = _G.firebaseRequest("GET", "presence") or {}
+    for name, data in pairs(globalPresence) do
+        if name ~= "notification" then
+            if type(data) ~= "table" or not data.timestamp or not data.jobId or not data.placeId then
+                _G.firebaseRequest("DELETE", "presence/" .. name)
+                continue
+            end
+
+            local playerTimestamp = tonumber(data.timestamp) or 0
+            if os.time() - playerTimestamp > 25 then continue end
+
+            local Row = Instance.new("Frame")
+            Row.Size = UDim2.new(1, -10, 0, 50)
+            Row.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+            Row.Parent = Scroller
+
+            local NameLbl = Instance.new("TextLabel")
+            NameLbl.Size = UDim2.new(0.4, 0, 1, 0)
+            NameLbl.Position = UDim2.new(0, 10, 0, 0)
+            NameLbl.BackgroundTransparency = 1
+            NameLbl.Text = "👤 " .. name
+            NameLbl.TextColor3 = Color3.fromRGB(240, 240, 240)
+            NameLbl.TextSize = 13
+            NameLbl.TextXAlignment = Enum.TextXAlignment.Left
+            NameLbl.Parent = Row
+
+            local LimitLbl = Instance.new("TextLabel")
+            LimitLbl.Size = UDim2.new(0.2, 0, 1, 0)
+            LimitLbl.Position = UDim2.new(0.42, 0, 0, 0)
+            LimitLbl.BackgroundTransparency = 1
+            LimitLbl.Text = data.playerCountStr or "1/1"
+            LimitLbl.TextColor3 = data.isFull and Color3.fromRGB(255, 75, 75) or Color3.fromRGB(120, 220, 120)
+            LimitLbl.TextSize = 12
+            LimitLbl.Parent = Row
+
+            local JoinBtn = Instance.new("TextButton")
+            JoinBtn.Size = UDim2.new(0, 100, 0, 28)
+            JoinBtn.Position = UDim2.new(1, -106, 0.5, -14)
+            local joinAllowed = data.allowJoining or _G.IS_ADMIN
+            JoinBtn.BackgroundColor3 = joinAllowed and Color3.fromRGB(55, 90, 160) or Color3.fromRGB(140, 50, 50)
+            JoinBtn.Text = joinAllowed and "Join" or "Join Disabled"
+            JoinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            JoinBtn.TextSize = 12
+            JoinBtn.Parent = Row
+
+            local joinCooldown = false
+            JoinBtn.MouseButton1Click:Connect(function()
+                if joinCooldown or (not joinAllowed and not _G.IS_ADMIN) then return end
+                joinCooldown = true task.delay(10, function() joinCooldown = false end)
+                _G.firebaseRequest("PUT", "presence/" .. name .. "/notification", { visitor = LocalPlayer.Name })
+                _G.createPopup("Connecting instance...")
+                TeleportService:TeleportToPlaceInstance(data.placeId or game.PlaceId, data.jobId, LocalPlayer)
+            end)
+        end
+    end
+end
+
+-- [[ APPLICATION RADAR ESP SYSTEM ]] --
+local activeEspTags = {}
+RunService.Heartbeat:Connect(function()
+    for name, tag in pairs(activeEspTags) do
+        if not shared.CurrentLocalScriptUsers[name] or not Players:FindFirstChild(name) then
+            if tag.Gui then tag.Gui:Destroy() end activeEspTags[name] = nil
+        end
+    end
+    for name, _ in pairs(shared.CurrentLocalScriptUsers) do
+        if name ~= LocalPlayer.Name then
+            local pObj = Players:FindFirstChild(name)
+            local root = pObj and pObj.Character and pObj.Character:FindFirstChild("HumanoidRootPart")
+            local localRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if root and localRoot and pObj.Character:FindFirstChild("Head") then
+                local tag = activeEspTags[name]
+                if not tag then
+                    local bGui = Instance.new("BillboardGui")
+                    bGui.Size = UDim2.new(0, 200, 0, 50)
+                    bGui.AlwaysOnTop = true
+                    bGui.StudsOffset = Vector3.new(0, 3, 0)
+                    bGui.Parent = game:GetService("CoreGui")
+                    local lbl = Instance.new("TextLabel")
+                    lbl.Size = UDim2.new(1, 0, 1, 0)
+                    lbl.BackgroundTransparency = 1
+                    lbl.TextColor3 = Color3.fromRGB(90, 240, 150)
+                    lbl.Font = Enum.Font.SourceSansBold
+                    lbl.TextSize = 12
+                    lbl.Parent = bGui
+                    tag = { Gui = bGui, Label = lbl } activeEspTags[name] = tag
+                end
+                tag.Gui.Adornee = pObj.Character.Head
+                tag.Label.Text = string.format("👤 %s\nUsing script too!\nRange: [%d studs]", name, math.floor((localRoot.Position - root.Position).Magnitude))
+            elseif activeEspTags[name] then
+                activeEspTags[name].Gui:Destroy() activeEspTags[name] = nil
+            end
+        end
+    end
+end)
+
+local function networkPulse()
+    local currentCount = #Players:GetPlayers()
+    _G.firebaseRequest("PUT", "presence/" .. LocalPlayer.Name, {
+        allowJoining = shared.AllowJoiningToggle,
+        jobId = game.JobId,
+        placeId = game.PlaceId,
+        playerCountStr = currentCount .. "/" .. Players.MaxPlayers,
+        isFull = (currentCount >= Players.MaxPlayers),
+        timestamp = os.time()
+    })
+    
+    local globalPresence = _G.firebaseRequest("GET", "presence") or {}
+    local activeLocalUsers = {}
+    
+    for name, data in pairs(globalPresence) do
+        if data and name ~= "notification" and type(data) == "table" and data.timestamp then
+            local pulseTimestamp = tonumber(data.timestamp) or 0
+            if (os.time() - pulseTimestamp < 10) then
+                if data.jobId == game.JobId then
+                    activeLocalUsers[name] = true
+                end
+                
+                if not shared.KnownGlobalUsers[name] then
+                    shared.KnownGlobalUsers[name] = { online = true, jobId = data.jobId }
+                    if name ~= LocalPlayer.Name then
+                        if data.jobId == game.JobId then
+                            if shared.Config.Notifywhenplayerjoinsyourserver then
+                                createGhostNotification("Player using same script", string.format("%s is using same script as same server as you!", name))
+                            end
+                        else
+                            if shared.Config.Notifywhenplayerjoinsyourserver then
+                                createGhostNotification("Player using same script", string.format("%s is online!", name))
+                            end
+                        end
+                    end
+                else
+                    local oldData = shared.KnownGlobalUsers[name]
+                    if oldData.jobId ~= data.jobId and data.jobId == game.JobId and name ~= LocalPlayer.Name then
+                        if shared.Config.Notifywhenplayerjoinsyourserver then
+                            createGhostNotification("Player using same script", string.format("%s is using same script as same server as you!", name))
+                        end
+                    end
+                    shared.KnownGlobalUsers[name].jobId = data.jobId
+                    shared.KnownGlobalUsers[name].online = true
+                end
+            end
+        end
+    end
+    
+    for existingUser, _ in pairs(shared.CurrentLocalScriptUsers) do
+        if not activeLocalUsers[existingUser] and existingUser ~= LocalPlayer.Name then
+            _G.createPopup(existingUser .. " has left your server.")
+            if shared.Config.Notifywhenplayerleavesyourserver then
+                createGhostNotification("Player using same script", string.format("%s has left the server!", existingUser))
+            end
+        end
+    end
+    
+    for gUser, state in pairs(shared.KnownGlobalUsers) do
+        local presenceEntry = globalPresence[gUser]
+        local entryTimestamp = presenceEntry and type(presenceEntry) == "table" and tonumber(presenceEntry.timestamp) or 0
+        if state.online and (not presenceEntry or os.time() - entryTimestamp >= 10) then
+            shared.KnownGlobalUsers[gUser] = nil
+        end
+    end
+    
+    shared.CurrentLocalScriptUsers = activeLocalUsers
+end
+_G.networkPulse = networkPulse
+
+Players.PlayerAdded:Connect(networkPulse)
+Players.PlayerRemoving:Connect(function(p)
+    if p == LocalPlayer then _G.firebaseRequest("DELETE", "presence/" .. LocalPlayer.Name) else networkPulse() end
+end)
+
+-- [[ DYNAMIC APPLICATION SETTINGS INTERFACE ]] --
+_G.renderSettings = function()
+    local SettingsTab = shared.Pages["Settings"]
+    SettingsTab:ClearAllChildren()
+    
+    local ContentScroller = Instance.new("ScrollingFrame")
+    ContentScroller.Size = UDim2.new(1, 0, 1, 0)
+    ContentScroller.BackgroundTransparency = 1
+    ContentScroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+    ContentScroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    ContentScroller.Parent = SettingsTab
+    
+    local MasterLayout = Instance.new("UIListLayout", ContentScroller)
+    MasterLayout.Padding = UDim.new(0, 6)
+    MasterLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    -- Controls & Configuration Container
+    local BaseControlsFrame = Instance.new("Frame")
+    BaseControlsFrame.Size = UDim2.new(1, -10, 0, 0)
+    BaseControlsFrame.AutomaticSize = Enum.AutomaticSize.Y
+    BaseControlsFrame.BackgroundTransparency = 1
+    BaseControlsFrame.LayoutOrder = 1
+    BaseControlsFrame.Parent = ContentScroller
+    
+    local ControlsLayout = Instance.new("UIListLayout", BaseControlsFrame)
+    ControlsLayout.Padding = UDim.new(0, 6)
+
+    -- Direct Joining Connection Control
+    local JoinToggleBtn = Instance.new("TextButton")
+    JoinToggleBtn.Size = UDim2.new(1, 0, 0, 30)
+    JoinToggleBtn.BackgroundColor3 = shared.AllowJoiningToggle and Color3.fromRGB(45, 110, 45) or Color3.fromRGB(140, 50, 50)
+    JoinToggleBtn.Text = "Allow Direct Joining: " .. (shared.AllowJoiningToggle and "ON" or "OFF")
+    JoinToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    JoinToggleBtn.TextSize = 12
+    JoinToggleBtn.Parent = BaseControlsFrame
+
+    JoinToggleBtn.MouseButton1Click:Connect(function()
+        local joinCooldown = tonumber(shared.Cooldowns and shared.Cooldowns.joinToggle) or 0
+        if os.time() - joinCooldown < 2 then return end
+        shared.Cooldowns.joinToggle = os.time()
+        shared.AllowJoiningToggle = not shared.AllowJoiningToggle
+        JoinToggleBtn.BackgroundColor3 = shared.AllowJoiningToggle and Color3.fromRGB(45, 110, 45) or Color3.fromRGB(140, 50, 50)
+        JoinToggleBtn.Text = "Allow Direct Joining: " .. (shared.AllowJoiningToggle and "ON" or "OFF")
+        saveConfig()
+        networkPulse()
+    end)
+
+    -- Custom Configuration Setup Helpers
+    local function addToggleSetting(property, titleText)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, 28)
+        btn.BackgroundColor3 = shared.Config[property] and Color3.fromRGB(45, 110, 45) or Color3.fromRGB(140, 50, 50)
+        btn.Text = titleText .. ": " .. (shared.Config[property] and "ON" or "OFF")
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 12
+        btn.Parent = BaseControlsFrame
+        
+        btn.MouseButton1Click:Connect(function()
+            shared.Config[property] = not shared.Config[property]
+            btn.BackgroundColor3 = shared.Config[property] and Color3.fromRGB(45, 110, 45) or Color3.fromRGB(140, 50, 50)
+            btn.Text = titleText .. ": " .. (shared.Config[property] and "ON" or "OFF")
+            saveConfig()
+        end)
+    end
+
+    local function addInputSetting(property, placeholder, isNumeric)
+        local container = Instance.new("Frame")
+        container.Size = UDim2.new(1, 0, 0, 32)
+        container.BackgroundTransparency = 1
+        container.Parent = BaseControlsFrame
+        
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0.45, 0, 1, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = placeholder
+        lbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+        lbl.TextSize = 11
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = container
+        
+        local box = Instance.new("TextBox")
+        box.Size = UDim2.new(0.53, 0, 1, 0)
+        box.Position = UDim2.new(0.47, 0, 0, 0)
+        box.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+        box.Text = tostring(shared.Config[property])
+        box.TextColor3 = Color3.fromRGB(255, 255, 255)
+        box.TextSize = 11
+        box.Parent = container
+        
+        box:GetPropertyChangedSignal("Text"):Connect(function()
+            if isNumeric then
+                shared.Config[property] = tonumber(box.Text) or box.Text
+            else
+                shared.Config[property] = box.Text
+            end
+            saveConfig()
+        end)
+    end
+
+    addToggleSetting("Notifywhenplayerjoinsyourserver", "Notify when player joins your server")
+    addToggleSetting("Notifywhennewmessageonchat", "Notify when new message on chat")
+    addToggleSetting("Notifywhenplayerleavesyourserver", "Notify when player leaves your server")
+    addToggleSetting("Notifywhennewfileispublished", "Notify when new file is published")
+    
+    addInputSetting("Notificationsoundid", "Notification sound id", false)
+    addInputSetting("Notificationsoundvolume", "Notification sound volume", true)
+    addInputSetting("Notificationsoundpitchmax", "Notification sound pitch max", true)
+    addInputSetting("Notificationsoundpitchmin", "Notification sound pitch min", true)
+
+    -- Lower List Registries Container (Scrollable Lists)
+    local RegistryContainer = Instance.new("Frame")
+    RegistryContainer.Size = UDim2.new(1, -10, 0, 140)
+    RegistryContainer.BackgroundTransparency = 1
+    RegistryContainer.LayoutOrder = 2
+    RegistryContainer.Parent = ContentScroller
+    
+    local RegLayout = Instance.new("UIListLayout", RegistryContainer)
+    RegLayout.Padding = UDim.new(0, 8)
+
+    -- Blocked Profiles Scrollable Segment
+    local BlockHeader = Instance.new("TextLabel")
+    BlockHeader.Size = UDim2.new(1, 0, 0, 20)
+    BlockHeader.BackgroundTransparency = 1
+    BlockHeader.Text = "--- Blocked Profiles Registry ---"
+    BlockHeader.TextColor3 = Color3.fromRGB(160, 160, 165)
+    BlockHeader.TextSize = 11
+    BlockHeader.Parent = RegistryContainer
+
+    local BlockedScrollFrame = Instance.new("ScrollingFrame")
+    BlockedScrollFrame.Size = UDim2.new(1, 0, 0, 100)
+    BlockedScrollFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+    BlockedScrollFrame.BorderSizePixel = 1
+    BlockedScrollFrame.BorderColor3 = Color3.fromRGB(45, 45, 50)
+    BlockedScrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    BlockedScrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    BlockedScrollFrame.Parent = RegistryContainer
+    
+    local BlockedListLayout = Instance.new("UIListLayout", BlockedScrollFrame)
+    BlockedListLayout.Padding = UDim.new(0, 4)
+
+    for blockedName, _ in pairs(shared.IgnoredPlayers) do
+        local BlockRow = Instance.new("Frame")
+        BlockRow.Size = UDim2.new(1, -8, 0, 28)
+        BlockRow.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+        BlockRow.Parent = BlockedScrollFrame
+
+        local NameLabel = Instance.new("TextLabel")
+        NameLabel.Size = UDim2.new(0.65, 0, 1, 0)
+        NameLabel.Position = UDim2.new(0, 8, 0, 0)
+        NameLabel.BackgroundTransparency = 1
+        NameLabel.Text = blockedName
+        NameLabel.TextColor3 = Color3.fromRGB(230, 230, 230)
+        NameLabel.TextSize = 11
+        NameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        NameLabel.Parent = BlockRow
+
+        local UnblockBtn = Instance.new("TextButton")
+        UnblockBtn.Size = UDim2.new(0, 65, 0, 20)
+        UnblockBtn.Position = UDim2.new(1, -70, 0.5, -10)
+        UnblockBtn.BackgroundColor3 = Color3.fromRGB(120, 50, 50)
+        UnblockBtn.Text = "Unblock"
+        UnblockBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        UnblockBtn.TextSize = 11
+        UnblockBtn.Parent = BlockRow
+
+        UnblockBtn.MouseButton1Click:Connect(function()
+            shared.IgnoredPlayers[blockedName] = nil
+            saveConfig()
+            _G.renderSettings()
+            _G.renderPublicFiles()
+        end)
+    end
+
+    -- Admin-Only Database Blacklist Controls
+    if _G.IS_ADMIN then
+        RegistryContainer.Size = UDim2.new(1, -10, 0, 270)
+        
+        local BanHeader = Instance.new("TextLabel")
+        BanHeader.Size = UDim2.new(1, 0, 0, 20)
+        BanHeader.BackgroundTransparency = 1
+        BanHeader.Text = "🛡️ --- Database Blacklist Control (Admin) ---"
+        BanHeader.TextColor3 = Color3.fromRGB(220, 90, 90)
+        BanHeader.TextSize = 11
+        BanHeader.Parent = RegistryContainer
+
+        local BannedScrollFrame = Instance.new("ScrollingFrame")
+        BannedScrollFrame.Size = UDim2.new(1, 0, 0, 100)
+        BannedScrollFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+        BannedScrollFrame.BorderSizePixel = 1
+        BannedScrollFrame.BorderColor3 = Color3.fromRGB(50, 35, 35)
+        BannedScrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+        BannedScrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        BannedScrollFrame.Parent = RegistryContainer
+        
+        local BannedListLayout = Instance.new("UIListLayout", BannedScrollFrame)
+        BannedListLayout.Padding = UDim.new(0, 4)
+
+        local banStorage = _G.firebaseRequest("GET", "bans") or {}
+        for bannedUser, data in pairs(banStorage) do
+            local BanRow = Instance.new("Frame")
+            BanRow.Size = UDim2.new(1, -8, 0, 28)
+            BanRow.BackgroundColor3 = Color3.fromRGB(40, 25, 25)
+            BanRow.Parent = BannedScrollFrame
+
+            local BannedNameLabel = Instance.new("TextLabel")
+            BannedNameLabel.Size = UDim2.new(0.65, 0, 1, 0)
+            BannedNameLabel.Position = UDim2.new(0, 8, 0, 0)
+            BannedNameLabel.BackgroundTransparency = 1
+            BannedNameLabel.Text = "🚫 " .. bannedUser
+            BannedNameLabel.TextColor3 = Color3.fromRGB(240, 200, 200)
+            BannedNameLabel.TextSize = 11
+            BannedNameLabel.TextXAlignment = Enum.TextXAlignment.Left
+            BannedNameLabel.Parent = BanRow
+
+            local UnbanBtn = Instance.new("TextButton")
+            UnbanBtn.Size = UDim2.new(0, 65, 0, 20)
+            UnbanBtn.Position = UDim2.new(1, -70, 0.5, -10)
+            UnbanBtn.BackgroundColor3 = Color3.fromRGB(45, 110, 45)
+            UnbanBtn.Text = "Unban"
+            UnbanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            UnbanBtn.TextSize = 11
+            UnbanBtn.Parent = BanRow
+
+            UnbanBtn.MouseButton1Click:Connect(function()
+                _G.firebaseRequest("DELETE", "bans/" .. bannedUser)
+                createPopup(bannedUser .. " got unmuted and can chat and publish files again.")
+                _G.renderSettings()
+            end)
+        end
+    end
+end
+
+-- [[ REPETITIVE DATABASE SYNCHRONIZATION RUNTIME ]] --
+task.spawn(function()
+    while task.wait(10) do
+        if not game:GetService("CoreGui"):FindFirstChild("GefBuildSaverCommunity") then break end
+        pcall(function()
+            local live = _G.firebaseRequest("GET", "presence/" .. LocalPlayer.Name .. "/notification")
+            if live and type(live) == "table" and live.visitor then
+                _G.createPopup(live.visitor .. " is joining your server!")
+                if shared.Config.Notifywhenplayerjoinsyourserver then
+                    createGhostNotification("Player using same script", string.format("%s is joining your server!", live.visitor))
+                end
+                _G.firebaseRequest("DELETE", "presence/" .. LocalPlayer.Name .. "/notification")
+            end
+            networkPulse()
+            _G.fetchChat()
+            _G.renderActivePlayers()
+            _G.renderPublicFiles()
+            pcall(function() _G.renderPublishFiles() end)
+        end)
+    end
+end)
+
+-- [[ SYNCHRONOUS BOOTSTRAP SUBSYSTEMS RUNTIME ]] --
+_G.renderSettings()
+_G.renderPublicFiles()
+_G.renderPublishFiles()
+_G.fetchChat()
+_G.renderActivePlayers()
+networkPulse()
